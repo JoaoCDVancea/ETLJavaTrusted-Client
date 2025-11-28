@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.opencsv.CSVReader;
-import com.opencsv.exceptions.CsvException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -36,13 +35,11 @@ public class S3 implements RequestHandler<Object, String> {
 
     @Override
     public String handleRequest(Object input, Context context) {
-        context.getLogger().log("Iniciando ETL Trusted -> Client (JSON Dashboard)...");
+        context.getLogger().log("Iniciando ETL Trusted -> Client (JSON Hierárquico)...");
 
         try {
             ZonedDateTime agora = ZonedDateTime.now(FUSO_BRASIL);
             LocalDate dataHoje = agora.toLocalDate();
-
-            context.getLogger().log("Processando dados para a data: " + dataHoje);
 
             List<String> garagens = listarGaragens(s3);
 
@@ -50,7 +47,7 @@ public class S3 implements RequestHandler<Object, String> {
                 processarGaragem(s3, garagemPrefix, dataHoje, agora, context);
             }
 
-            return "Sucesso! Dashboard atualizada.";
+            return "Sucesso! Dashboard hierárquica atualizada.";
 
         } catch (Exception e) {
             context.getLogger().log("ERRO CRITICO: " + e.getMessage());
@@ -68,6 +65,12 @@ public class S3 implements RequestHandler<Object, String> {
         DashboardData dashboardData = baixarOuCriarJson(s3, garagemPrefix + nomeArquivoJson, jsonLocalPath, garagemIdLimpo);
         dashboardData.lastUpdate = agora;
 
+        String chaveMes = String.format("%d-%02d", dataHoje.getYear(), dataHoje.getMonthValue());
+
+        if (!dashboardData.history.containsKey(chaveMes)) {
+            dashboardData.history.put(chaveMes, new MonthData());
+        }
+
         String caminhoDiaTrusted = String.format("ano=%d/mes=%02d/dia=%02d/",
                 dataHoje.getYear(), dataHoje.getMonthValue(), dataHoje.getDayOfMonth());
 
@@ -75,12 +78,10 @@ public class S3 implements RequestHandler<Object, String> {
         List<Path> csvsDoDia = baixarCSVsDoDia(s3, prefixoCompleto, garagemPrefix);
 
         if (!csvsDoDia.isEmpty()) {
-            atualizarEstatisticasDoDia(dashboardData, csvsDoDia, dataHoje);
-        } else {
-            context.getLogger().log("   [INFO] Sem dados novos hoje para " + garagemIdLimpo);
+            atualizarEstatisticasDoDia(dashboardData, csvsDoDia, dataHoje, chaveMes);
         }
 
-        calcularResumosMensais(dashboardData, dataHoje);
+        recalcularResumos(dashboardData, dataHoje);
 
         objectMapper.writeValue(jsonLocalPath.toFile(), dashboardData);
         uploadParaS3(s3, garagemPrefix + nomeArquivoJson, jsonLocalPath);
@@ -91,20 +92,20 @@ public class S3 implements RequestHandler<Object, String> {
         limparTemp(Paths.get("/tmp", garagemPrefix));
     }
 
-    private void atualizarEstatisticasDoDia(DashboardData data, List<Path> csvs, LocalDate dataHoje) {
+    private void atualizarEstatisticasDoDia(DashboardData data, List<Path> csvs, LocalDate dataHoje, String chaveMes) {
         DailyStats statsHoje = new DailyStats();
         CurrentStatus ultimoStatus = new CurrentStatus();
 
         double somaCpu = 0, somaRam = 0, somaDisk = 0;
         int totalPontos = 0;
 
-        long minBytesUsados = Long.MAX_VALUE;
-        long maxBytesUsados = Long.MIN_VALUE;
+        double minMbEnviado = Double.MAX_VALUE;
+        double maxMbEnviado = Double.MIN_VALUE;
 
         csvs.sort(Comparator.comparing(Path::getFileName));
 
         for (Path csvPath : csvs) {
-            try (CSVReader reader = new CSVReader(new FileReader(csvPath.toFile()))) {
+            try (CSVReader reader = new CSVReader(new FileReader(csvPath.toFile()))) { // Padrão (Vírgula)
                 List<String[]> linhas = reader.readAll();
                 if (linhas.isEmpty() || linhas.size() < 2) continue;
 
@@ -112,15 +113,19 @@ public class S3 implements RequestHandler<Object, String> {
                     String[] l = linhas.get(i);
                     try {
                         String timestamp = l[0];
-                        double cpu = Double.parseDouble(l[2]);
-                        double ram = Double.parseDouble(l[4]);
-                        long diskTotalBytes = Long.parseLong(l[5]);
-                        double diskPct = Double.parseDouble(l[6]);
+                        double cpu = Double.parseDouble(l[2].replace(",", "."));
+                        double ram = Double.parseDouble(l[4].replace(",", "."));
+
+                        double diskTotalVal = Double.parseDouble(l[5].replace(",", "."));
+                        long diskTotalBytes = (long) (diskTotalVal * 1024 * 1024 * 1024); // Assume vindo em GB
+                        double diskPct = Double.parseDouble(l[6].replace(",", "."));
+
+                        double totalMbAcumulado = Double.parseDouble(l[7].replace(",", "."));
+
+                        if (totalMbAcumulado < minMbEnviado) minMbEnviado = totalMbAcumulado;
+                        if (totalMbAcumulado > maxMbEnviado) maxMbEnviado = totalMbAcumulado;
 
                         long diskUsedBytes = (long) (diskTotalBytes * (diskPct / 100.0));
-
-                        if (diskUsedBytes < minBytesUsados) minBytesUsados = diskUsedBytes;
-                        if (diskUsedBytes > maxBytesUsados) maxBytesUsados = diskUsedBytes;
 
                         somaCpu += cpu;
                         somaRam += ram;
@@ -145,46 +150,50 @@ public class S3 implements RequestHandler<Object, String> {
             statsHoje.avgDiskPercent = arredondar(somaDisk / totalPontos, 2);
             statsHoje.dataPointsCount = totalPontos;
 
-            long deltaBytes = Math.max(0, maxBytesUsados - minBytesUsados);
-            statsHoje.dailyIngestedGb = bytesParaGb(deltaBytes);
+            if (minMbEnviado == Double.MAX_VALUE) minMbEnviado = 0;
+            if (maxMbEnviado == Double.MIN_VALUE) maxMbEnviado = 0;
+
+            double deltaMb = maxMbEnviado - minMbEnviado;
+            statsHoje.dailyIngestedGb = arredondar(deltaMb / 1024.0, 2);
 
             data.currentStatus = ultimoStatus;
-            data.history.put(dataHoje, statsHoje);
+
+            data.history.get(chaveMes).days.put(dataHoje.getDayOfMonth(), statsHoje);
         }
     }
 
-    private void calcularResumosMensais(DashboardData data, LocalDate hoje) {
-        data.currentMonthSummary = gerarResumoMensal(data, hoje, true);
+    private void recalcularResumos(DashboardData data, LocalDate dataHoje) {
 
-        LocalDate mesPassado = hoje.minusMonths(1);
-        data.lastMonthSummary = gerarResumoMensal(data, mesPassado, false);
-    }
+        for (Map.Entry<String, MonthData> entradaMes : data.history.entrySet()) {
+            String chaveAnoMes = entradaMes.getKey();
+            MonthData dadosDoMes = entradaMes.getValue();
 
-    private MonthlySummary gerarResumoMensal(DashboardData data, LocalDate dataReferencia, boolean isMesAtual) {
-        MonthlySummary resumo = new MonthlySummary();
-        resumo.monthName = dataReferencia.getMonth().toString();
+            double totalGb = dadosDoMes.days.values().stream()
+                    .mapToDouble(d -> d.dailyIngestedGb)
+                    .sum();
 
-        double totalGb = data.history.entrySet().stream()
-                .filter(e -> e.getKey().getYear() == dataReferencia.getYear() &&
-                        e.getKey().getMonth() == dataReferencia.getMonth())
-                .mapToDouble(e -> e.getValue().dailyIngestedGb)
-                .sum();
+            dadosDoMes.summary.totalIngestedGb = arredondar(totalGb, 2);
+            dadosDoMes.summary.monthName = chaveAnoMes;
 
-        resumo.totalIngestedGb = arredondar(totalGb, 2);
+            String[] partes = chaveAnoMes.split("-");
+            int ano = Integer.parseInt(partes[0]);
+            int mes = Integer.parseInt(partes[1]);
+            int diasNoMes = LocalDate.of(ano, mes, 1).lengthOfMonth();
 
-        if (isMesAtual) {
-            int diaAtual = dataReferencia.getDayOfMonth();
-            int diasNoMes = dataReferencia.lengthOfMonth();
-            if (diaAtual > 0) {
-                double projecao = (totalGb / diaAtual) * diasNoMes;
-                resumo.projectionGb = arredondar(projecao, 2);
+            int diasConsiderados;
+            if (ano == dataHoje.getYear() && mes == dataHoje.getMonthValue()) {
+                diasConsiderados = dataHoje.getDayOfMonth();
             } else {
-                resumo.projectionGb = 0.0;
+                diasConsiderados = diasNoMes;
             }
-        } else {
-            resumo.projectionGb = totalGb;
+
+            if (diasConsiderados > 0) {
+                double projecao = (totalGb / diasConsiderados) * diasNoMes;
+                dadosDoMes.summary.projectionGb = arredondar(projecao, 2);
+            } else {
+                dadosDoMes.summary.projectionGb = 0.0;
+            }
         }
-        return resumo;
     }
 
     private DashboardData baixarOuCriarJson(S3Client s3, String key, Path destino, String garageId) {
@@ -193,12 +202,8 @@ public class S3 implements RequestHandler<Object, String> {
             GetObjectRequest req = GetObjectRequest.builder().bucket(BUCKET_CLIENT).key(key).build();
             s3.getObject(req, destino);
             return objectMapper.readValue(destino.toFile(), DashboardData.class);
-        } catch (NoSuchKeyException e) {
-            DashboardData novo = new DashboardData();
-            novo.garageId = garageId;
-            return novo;
         } catch (Exception e) {
-            System.err.println("Erro ao ler JSON: " + e.getMessage());
+            System.out.println("JSON novo criado para: " + garageId);
             DashboardData novo = new DashboardData();
             novo.garageId = garageId;
             return novo;
@@ -259,9 +264,14 @@ public class S3 implements RequestHandler<Object, String> {
         public String garageId;
         public ZonedDateTime lastUpdate;
         public CurrentStatus currentStatus = new CurrentStatus();
-        public MonthlySummary currentMonthSummary = new MonthlySummary();
-        public MonthlySummary lastMonthSummary = new MonthlySummary();
-        public Map<LocalDate, DailyStats> history = new HashMap<>();
+
+        public Map<String, MonthData> history = new TreeMap<>();
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class MonthData {
+        public MonthlySummary summary = new MonthlySummary();
+        public Map<Integer, DailyStats> days = new TreeMap<>();
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
